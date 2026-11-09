@@ -1,0 +1,495 @@
+name: Build
+
+# Builds Pocket Library from the private source repo and publishes the apps
+# (GitHub Release) and the website (GitHub Pages). Started by
+# 3-push-update.bat with the version number and release notes.
+# This repo holds no app code - only this file and a README.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, e.g. 2.3.0 (empty = just rebuild the website)
+        required: false
+        default: ''
+      notes:
+        description: What's new (shown in the app's update popup)
+        required: false
+        default: ''
+      ref:
+        description: Branch or tag of the source to build
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_NOTES: ${{ inputs.notes }}
+  FLUTTER_CHANNEL: stable
+  # Generates the native folder for a platform if the repo doesn't have it yet.
+  # Existing files are never overwritten.
+  CREATE_ARGS: --org io.gametracker --project-name game_tracker
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - run: flutter pub get
+      - name: Analyze
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Set up release signing
+        if: env.KEYSTORE_BASE64 != ''
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
+          cat > android/key.properties <<PROPS
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=upload-keystore.jks
+          PROPS
+      - name: Build APK
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build apk --release --obfuscate --split-debug-info=build/debug-info \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/game-tracker-android.apk"
+      - name: Build for Google Play (AAB)
+        # Google Play installs updates itself, so this build has no in-app
+        # updater and doesn't ask to install packages (Play policy).
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          sed -i '/android.permission.REQUEST_INSTALL_PACKAGES/d' android/app/src/main/AndroidManifest.xml
+          flutter build appbundle --release --obfuscate --split-debug-info=build/debug-info-aab \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO=
+          cp build/app/outputs/bundle/release/app-release.aab "dist/game-tracker-google-play.aab"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - name: Create the iOS project
+        run: flutter create --platforms=ios $CREATE_ARGS .
+      - name: App name, link scheme and permissions
+        run: |
+          P=ios/Runner/Info.plist
+          plutil -replace CFBundleDisplayName -string "Pocket Library" $P
+          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker"]}]' $P
+          plutil -replace FlutterDeepLinkingEnabled -bool NO $P
+          plutil -replace NSCameraUsageDescription -string "Pocket Library uses the camera to scan friends' profile QR codes." $P
+          plutil -replace NSPhotoLibraryUsageDescription -string "Pocket Library needs access to your photos so you can choose a profile picture." $P
+          plutil -replace NSPhotoLibraryAddUsageDescription -string "Pocket Library saves images like your Gamer Passport to your photo library." $P
+          plutil -replace LSApplicationQueriesSchemes -json '["https"]' $P
+          plutil -lint $P
+          # Some plugins need a newer iOS (home_widget 14+, ML Kit text recognition 15.5+).
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.5;/g' ios/Runner.xcodeproj/project.pbxproj
+      - name: App icon
+        run: |
+          for f in ios/Runner/Assets.xcassets/AppIcon.appiconset/*.png; do
+            px=$(sips -g pixelWidth "$f" | awk '/pixelWidth/{print $2}')
+            sips -s format png -z "$px" "$px" assets/icon/ios-1024.png --out "$f" >/dev/null
+          done
+          ls -la ios/Runner/Assets.xcassets/AppIcon.appiconset
+      - name: Start-up screen
+        run: |
+          # The logo on black, matching the app's own splash.
+          for f in ios/Runner/Assets.xcassets/LaunchImage.imageset/LaunchImage*.png; do
+            case "$f" in *@3x*) px=360;; *@2x*) px=240;; *) px=120;; esac
+            sips -s format png -z "$px" "$px" assets/brand/logo.png --out "$f" >/dev/null
+          done
+          sed -i '' -E 's/(key="backgroundColor"[^>]*)red="1" green="1" blue="1"/\1red="0" green="0" blue="0"/' ios/Runner/Base.lproj/LaunchScreen.storyboard
+          sed -i '' -E 's/key="backgroundColor" systemColor="systemBackgroundColor"/key="backgroundColor" red="0" green="0" blue="0" alpha="1" colorSpace="custom" customColorSpace="sRGB"/' ios/Runner/Base.lproj/LaunchScreen.storyboard
+          grep -n backgroundColor ios/Runner/Base.lproj/LaunchScreen.storyboard || true
+      - run: flutter pub get
+      - name: Generate the Xcode config
+        run: |
+          flutter build ios --config-only --release --no-codesign
+          if [ -f ios/Podfile ]; then
+            sed -i '' "s/^#* *platform :ios.*/platform :ios, '15.5'/" ios/Podfile
+            grep -q "^platform :ios" ios/Podfile || sed -i '' "1s/^/platform :ios, '15.5'\n/" ios/Podfile
+          fi
+      - name: Build (unsigned)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build ios --release --no-codesign --obfuscate --split-debug-info=build/debug-info \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          mkdir -p Payload dist
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr dist/game-tracker-ios-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - name: Create the Windows project
+        shell: bash
+        run: |
+          flutter create --platforms=windows $CREATE_ARGS .
+          sed -i 's/L"game_tracker"/L"Pocket Library"/' windows/runner/main.cpp
+          cp assets/icon/app_icon.ico windows/runner/resources/app_icon.ico
+      - run: flutter pub get
+      - name: Build
+        shell: bash
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build windows --release --obfuscate --split-debug-info=build/debug-info \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Rename-Item build/windows/x64/runner/Release "Pocket Library"
+          Compress-Archive -Path "build/windows/x64/runner/Pocket Library" -DestinationPath dist/game-tracker-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev libwebkit2gtk-4.1-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - name: Create the Linux project
+        run: |
+          flutter create --platforms=linux $CREATE_ARGS .
+          sed -i 's/"game_tracker"/"Pocket Library"/g' linux/runner/my_application.cc
+      - run: flutter pub get
+      - name: Build
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build linux --release --obfuscate --split-debug-info=build/debug-info \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          mkdir -p dist
+          cp -r build/linux/x64/release/bundle game-tracker
+          tar -czf dist/game-tracker-linux-x64.tar.gz game-tracker
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - name: Create the macOS project
+        run: flutter create --platforms=macos $CREATE_ARGS .
+      - name: App name, link scheme, permissions and sandbox access
+        run: |
+          P=macos/Runner/Info.plist
+          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker"]}]' $P
+          plutil -replace FlutterDeepLinkingEnabled -bool NO $P
+          plutil -replace NSCameraUsageDescription -string "Pocket Library uses the camera to scan friends' profile QR codes." $P
+          plutil -replace NSPhotoLibraryAddUsageDescription -string "Pocket Library saves images like your Gamer Passport to your photo library." $P
+          plutil -lint $P
+          plutil -replace CFBundleName -string "Pocket Library" $P
+          plutil -replace CFBundleDisplayName -string "Pocket Library" $P
+          # The Mac app sandbox blocks the network, camera and photos unless allowed.
+          for E in macos/Runner/DebugProfile.entitlements macos/Runner/Release.entitlements; do
+            for K in com.apple.security.network.client com.apple.security.device.camera com.apple.security.personal-information.photos-library com.apple.security.files.user-selected.read-only; do
+              /usr/libexec/PlistBuddy -c "Set :$K true" "$E" 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$K bool true" "$E"
+            done
+            plutil -lint "$E"
+          done
+          sed -i '' 's/MACOSX_DEPLOYMENT_TARGET = [0-9.]*;/MACOSX_DEPLOYMENT_TARGET = 11.0;/g' macos/Runner.xcodeproj/project.pbxproj
+      - name: App icon
+        run: |
+          for f in macos/Runner/Assets.xcassets/AppIcon.appiconset/*.png; do
+            px=$(sips -g pixelWidth "$f" | awk '/pixelWidth/{print $2}')
+            sips -s format png -z "$px" "$px" assets/icon/macos-1024.png --out "$f" >/dev/null
+          done
+          ls -la macos/Runner/Assets.xcassets/AppIcon.appiconset
+      - run: flutter pub get
+      - name: Generate the Xcode config
+        run: |
+          flutter build macos --config-only --release
+          if [ -f macos/Podfile ]; then
+            sed -i '' "s/^platform :osx.*/platform :osx, '11.0'/" macos/Podfile
+          fi
+      - name: Build
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build macos --release --obfuscate --split-debug-info=build/debug-info \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          mkdir -p dist
+          APP=$(ls -d build/macos/Build/Products/Release/*.app | head -1)
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/game-tracker-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+      - name: Version
+        # v2.1.0 tag -> 2.1.0; other builds use pubspec.yaml. The build number
+        # always grows, so Android accepts each release as an update.
+        shell: bash
+        run: |
+          if [ -n "$RELEASE_VERSION" ]; then V="${RELEASE_VERSION#v}"
+          else V="$(grep -m1 '^version:' pubspec.yaml | sed -E 's/version: *//; s/\+.*//')"; fi
+          echo "APP_VERSION=$V" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+          echo "Building version $V ($((GITHUB_RUN_NUMBER + 100)))"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+      - name: Create the web project
+        run: |
+          # web/auth.html is already in the repo; this adds index.html, icons and the manifest.
+          flutter create --platforms=web $CREATE_ARGS .
+          sed -i 's|<title>game_tracker</title>|<title>Pocket Library</title>|' web/index.html
+          sed -i 's|content="game_tracker"|content="Pocket Library"|g' web/index.html
+          sed -i 's|"name": "game_tracker"|"name": "Pocket Library"|; s|"short_name": "game_tracker"|"short_name": "Pocket Library"|' web/manifest.json
+          sed -i -E 's|"background_color": "#[0-9A-Fa-f]+"|"background_color": "#000000"|; s|"theme_color": "#[0-9A-Fa-f]+"|"theme_color": "#141A2A"|' web/manifest.json
+          python3 tool/ci/web_splash.py
+          python3 tool/ci/web_seo.py
+      - run: flutter pub get
+      - name: Build
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          flutter build web --release --base-href "/${{ github.event.repository.name }}/" \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          touch build/web/.nojekyll
+          # Static pages (awards results, account deletion) talk to Supabase with the
+          # public anon key, like the app itself. Fill it in here; never in the repo.
+          for f in build/web/*.html; do
+            sed -i "s|__SUPABASE_URL__|$SUPABASE_URL|g; s|__SUPABASE_ANON_KEY__|$SUPABASE_ANON_KEY|g" "$f"
+          done
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+  website:
+    # Publishes the web build from main to https://<user>.github.io/<repo>/
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: web
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+  release:
+    # Publishes whatever built, even if one platform failed.
+    if: always() && inputs.version != ''
+    needs: [android, ios, macos, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release notes
+        # "What's new" comes from the tag message (3-push-update.bat writes it
+        # from release-notes.txt / update-message.txt); the app shows it in
+        # its "Update available" popup.
+        shell: bash
+        run: |
+          NOTES="$RELEASE_NOTES"
+          if [ -z "${NOTES// }" ]; then
+            NOTES="Bug fixes and improvements."
+          fi
+          OWNER="${GITHUB_REPOSITORY%%/*}"; REPO="${GITHUB_REPOSITORY#*/}"
+          {
+            echo "## What's new"
+            echo "$NOTES"
+            echo
+            echo "## Downloads"
+            echo "| Platform | File | How to install |"
+            echo "|---|---|---|"
+            echo "| Android | \`game-tracker-android.apk\` | Open it on your phone and allow installing from this source. Already have the app? It offers the update itself. |"
+            echo "| Windows | \`game-tracker-windows-x64.zip\` | Unzip anywhere and run \`game_tracker.exe\`. |"
+            echo "| macOS | \`game-tracker-macos.zip\` | Unzip, move to Applications, then right-click → Open the first time (it isn't notarised by Apple). |"
+            echo "| Linux | \`game-tracker-linux-x64.tar.gz\` | Extract and run \`game-tracker/game_tracker\` (needs GTK 3 and WebKitGTK 4.1). |"
+            echo "| iPhone / iPad | \`game-tracker-ios-unsigned.ipa\` | Unsigned: install with a sideloading tool such as Sideloadly or AltStore using your Apple ID. |"
+            echo "| Web | — | Open https://${OWNER,,}.github.io/${REPO}/ in any browser. |"
+            echo
+            echo "Sign in with the same account everywhere and your library, lists, reviews and alerts stay in sync."
+          } > release-notes.md
+          cat release-notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          # Only the app downloads (not the website bundle, which is also an artifact).
+          files: |
+            dist/*.apk
+            dist/*.aab
+            dist/*.ipa
+            dist/*.zip
+            dist/*.tar.gz
+          body_path: release-notes.md
+          tag_name: v${{ inputs.version }}
+          name: Pocket Library ${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          fail_on_unmatched_files: false
