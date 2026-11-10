@@ -91,6 +91,15 @@ jobs:
             --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
           mkdir -p dist
           cp build/app/outputs/flutter-apk/app-release.apk "dist/game-tracker-android.apk"
+          # A much smaller file for 64-bit phones (almost all of them): the
+          # in-app updater downloads this one. Same version code as above.
+          flutter build apk --release --target-platform android-arm64 --obfuscate --split-debug-info=build/debug-info-arm64 \
+            --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+            --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
+            --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
+            --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/game-tracker-android-arm64.apk"
       - name: Build for Google Play (AAB)
         # Google Play installs updates itself, so this build has no in-app
         # updater and doesn't ask to install packages (Play policy).
@@ -140,12 +149,13 @@ jobs:
         run: |
           P=ios/Runner/Info.plist
           plutil -replace CFBundleDisplayName -string "Pocket Library" $P
-          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker"]}]' $P
+          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker","pocketlibrary"]}]' $P
           plutil -replace FlutterDeepLinkingEnabled -bool NO $P
           plutil -replace NSCameraUsageDescription -string "Pocket Library uses the camera to scan friends' profile QR codes." $P
           plutil -replace NSPhotoLibraryUsageDescription -string "Pocket Library needs access to your photos so you can choose a profile picture." $P
           plutil -replace NSPhotoLibraryAddUsageDescription -string "Pocket Library saves images like your Gamer Passport to your photo library." $P
           plutil -replace LSApplicationQueriesSchemes -json '["https"]' $P
+          plutil -replace NSLocationWhenInUseUsageDescription -string "Pocket Library uses your rough location only when you ask, to find gaming events near you." $P
           plutil -lint $P
           # Some plugins need a newer iOS (home_widget 14+, ML Kit text recognition 15.5+).
           sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.5;/g' ios/Runner.xcodeproj/project.pbxproj
@@ -322,7 +332,7 @@ jobs:
       - name: App name, link scheme, permissions and sandbox access
         run: |
           P=macos/Runner/Info.plist
-          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker"]}]' $P
+          plutil -replace CFBundleURLTypes -json '[{"CFBundleTypeRole":"Editor","CFBundleURLName":"gametracker","CFBundleURLSchemes":["gametracker","pocketlibrary"]}]' $P
           plutil -replace FlutterDeepLinkingEnabled -bool NO $P
           plutil -replace NSCameraUsageDescription -string "Pocket Library uses the camera to scan friends' profile QR codes." $P
           plutil -replace NSPhotoLibraryAddUsageDescription -string "Pocket Library saves images like your Gamer Passport to your photo library." $P
@@ -463,12 +473,15 @@ jobs:
             echo "## Downloads"
             echo "| Platform | File | How to install |"
             echo "|---|---|---|"
-            echo "| Android | \`game-tracker-android.apk\` | Open it on your phone and allow installing from this source. Already have the app? It offers the update itself. |"
-            echo "| Windows | \`game-tracker-windows-x64.zip\` | Unzip anywhere and run \`game_tracker.exe\`. |"
-            echo "| macOS | \`game-tracker-macos.zip\` | Unzip, move to Applications, then right-click → Open the first time (it isn't notarised by Apple). |"
-            echo "| Linux | \`game-tracker-linux-x64.tar.gz\` | Extract and run \`game-tracker/game_tracker\` (needs GTK 3 and WebKitGTK 4.1). |"
-            echo "| iPhone / iPad | \`game-tracker-ios-unsigned.ipa\` | Unsigned: install with a sideloading tool such as Sideloadly or AltStore using your Apple ID. |"
+            echo "| Android | \`pocket-library-android.apk\` | Open it on your phone and allow installing from this source. Already have the app? It offers the update itself. |"
+            echo "| Android (smaller) | \`pocket-library-android-arm64.apk\` | The same app for 64-bit phones (nearly all phones since 2017), about half the size. |"
+            echo "| Windows | \`pocket-library-windows-x64.zip\` | Unzip anywhere and run \`game_tracker.exe\`. |"
+            echo "| macOS | \`pocket-library-macos.zip\` | Unzip, move to Applications, then right-click → Open the first time (it isn't notarised by Apple). |"
+            echo "| Linux | \`pocket-library-linux-x64.tar.gz\` | Extract and run \`game-tracker/game_tracker\` (needs GTK 3 and WebKitGTK 4.1). |"
+            echo "| iPhone / iPad | \`pocket-library-ios-unsigned.ipa\` | Unsigned: install with a sideloading tool such as Sideloadly or AltStore using your Apple ID. |"
             echo "| Web | — | Open https://${OWNER,,}.github.io/${REPO}/ in any browser. |"
+            echo
+            echo "(The game-tracker-… files are the same app, kept so older versions can update themselves.)"
             echo
             echo "Sign in with the same account everywhere and your library, lists, reviews and alerts stay in sync."
           } > release-notes.md
@@ -477,7 +490,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - run: ls -la dist
+      - name: Name the downloads Pocket Library
+        # pocket-library-* are the files to download; the game-tracker-*
+        # copies stay so versions up to 2.3.0 can still update themselves.
+        run: |
+          cd dist
+          for f in game-tracker-*; do [ -f "$f" ] && cp "$f" "pocket-library-${f#game-tracker-}"; done
+          ls -la
       - uses: softprops/action-gh-release@v2
         with:
           # Only the app downloads (not the website bundle, which is also an artifact).
