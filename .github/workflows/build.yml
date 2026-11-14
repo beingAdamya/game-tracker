@@ -502,6 +502,13 @@ jobs:
     needs: [android, ios, macos, windows, linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/game-tracker-source
+          ref: ${{ inputs.ref || 'main' }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          path: src
+          sparse-checkout: tool/ci
       - name: Release notes
         # "What's new" comes from the tag message (3-push-update.bat writes it
         # from release-notes.txt / update-message.txt); the app shows it in
@@ -552,9 +559,12 @@ jobs:
         run: |
           if [ -z "$UPDATE_SIGNING_KEY" ]; then echo "::warning::UPDATE_SIGNING_KEY is not set - not signing"; exit 0; fi
           python3 -m pip install --quiet "cryptography>=42"
+          # The public build fetches only the build scripts, into src/.
+          SIGNER="$GITHUB_WORKSPACE/tool/ci/sign_update.py"
+          [ -f "$SIGNER" ] || SIGNER="$GITHUB_WORKSPACE/src/tool/ci/sign_update.py"
           cd dist
           for f in *windows*.zip *windows*setup*.exe *linux*.tar.gz; do
-            [ -f "$f" ] && python3 ../tool/ci/sign_update.py sign "$f"
+            [ -f "$f" ] && python3 "$SIGNER" sign "$f"
           done
           ls -la
       - uses: softprops/action-gh-release@v2
