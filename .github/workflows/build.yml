@@ -230,8 +230,22 @@ jobs:
         run: |
           flutter create --platforms=windows $CREATE_ARGS .
           sed -i 's/L"game_tracker"/L"Pocket Library"/' windows/runner/main.cpp
+          # One copy only (links reach the running copy) and the taskbar jump list.
+          python tool/ci/patch_windows_runner.py
           cp assets/icon/app_icon.ico windows/runner/resources/app_icon.ico
       - run: flutter pub get
+      - name: Update signing key (public half)
+        # The app only installs updates signed with the matching private key.
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+            python -m pip install --quiet "cryptography>=42"
+            echo "UPDATE_PUBLIC_KEY=$(python tool/ci/sign_update.py pubkey)" >> "$GITHUB_ENV"
+          else
+            echo "::warning::UPDATE_SIGNING_KEY is not set - updates won't be signed"
+          fi
       - name: Build
         shell: bash
         env:
@@ -243,6 +257,7 @@ jobs:
             --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
             --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
             --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=UPDATE_PUBLIC_KEY="$UPDATE_PUBLIC_KEY" \
             --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
       - name: Package
         shell: pwsh
@@ -250,6 +265,17 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Rename-Item build/windows/x64/runner/Release "Pocket Library"
           Compress-Archive -Path "build/windows/x64/runner/Pocket Library" -DestinationPath dist/game-tracker-windows-x64.zip
+      - name: Installer
+        # A normal Windows installer (Start menu, desktop shortcut, uninstall
+        # from Settings). Installs for the current user, no admin needed.
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress | Out-Null
+            $env:Path += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          $env:APP_SOURCE_DIR = (Resolve-Path "build/windows/x64/runner/Pocket Library").Path
+          iscc tool/ci/windows-installer.iss
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -276,7 +302,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev libwebkit2gtk-4.1-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
       - uses: subosito/flutter-action@v2
         with:
           channel: ${{ env.FLUTTER_CHANNEL }}
@@ -285,7 +311,17 @@ jobs:
         run: |
           flutter create --platforms=linux $CREATE_ARGS .
           sed -i 's/"game_tracker"/"Pocket Library"/g' linux/runner/my_application.cc
+          # One copy only: opening the app again shows the running window.
+          python3 tool/ci/patch_linux_runner.py
       - run: flutter pub get
+      - name: Update signing key (public half)
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "$UPDATE_SIGNING_KEY" ]; then
+            python3 -m pip install --quiet "cryptography>=42"
+            echo "UPDATE_PUBLIC_KEY=$(python3 tool/ci/sign_update.py pubkey)" >> "$GITHUB_ENV"
+          fi
       - name: Build
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -296,6 +332,7 @@ jobs:
             --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY" \
             --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER" \
             --dart-define=APP_VERSION="$APP_VERSION" \
+            --dart-define=UPDATE_PUBLIC_KEY="$UPDATE_PUBLIC_KEY" \
             --dart-define=GITHUB_REPO="$GITHUB_REPOSITORY"
           mkdir -p dist
           cp -r build/linux/x64/release/bundle game-tracker
@@ -328,7 +365,10 @@ jobs:
           channel: ${{ env.FLUTTER_CHANNEL }}
           cache: true
       - name: Create the macOS project
-        run: flutter create --platforms=macos $CREATE_ARGS .
+        run: |
+          flutter create --platforms=macos $CREATE_ARGS .
+          # Dock menu shortcuts, and the Dock icon brings back a window hidden to the menu bar.
+          python3 tool/ci/patch_macos_runner.py
       - name: App name, link scheme, permissions and sandbox access
         run: |
           P=macos/Runner/Info.plist
@@ -412,6 +452,8 @@ jobs:
           sed -i -E 's|"background_color": "#[0-9A-Fa-f]+"|"background_color": "#000000"|; s|"theme_color": "#[0-9A-Fa-f]+"|"theme_color": "#141A2A"|' web/manifest.json
           python3 tool/ci/web_splash.py
           python3 tool/ci/web_seo.py
+          # Shortcuts on the installed web app's icon.
+          python3 tool/ci/web_manifest.py
       - run: flutter pub get
       - name: Build
         env:
@@ -430,6 +472,11 @@ jobs:
           for f in build/web/*.html; do
             sed -i "s|__SUPABASE_URL__|$SUPABASE_URL|g; s|__SUPABASE_ANON_KEY__|$SUPABASE_ANON_KEY|g" "$f"
           done
+          # The account-deletion page gets its Supabase library from this website
+          # (a fixed version from the npm registry), not from a third-party CDN.
+          mkdir -p build/web/vendor
+          (cd "$RUNNER_TEMP" && npm pack @supabase/supabase-js@2.45.4 --silent && tar -xzf supabase-supabase-js-2.45.4.tgz package/dist/umd/supabase.js)
+          cp "$RUNNER_TEMP/package/dist/umd/supabase.js" build/web/vendor/supabase.js
       - uses: actions/upload-pages-artifact@v3
         with:
           path: build/web
@@ -475,9 +522,10 @@ jobs:
             echo "|---|---|---|"
             echo "| Android | \`pocket-library-android.apk\` | Open it on your phone and allow installing from this source. Already have the app? It offers the update itself. |"
             echo "| Android (smaller) | \`pocket-library-android-arm64.apk\` | The same app for 64-bit phones (nearly all phones since 2017), about half the size. |"
-            echo "| Windows | \`pocket-library-windows-x64.zip\` | Unzip anywhere and run \`game_tracker.exe\`. |"
+            echo "| Windows | \`pocket-library-windows-setup.exe\` | Run it to install (no admin needed); it adds a Start menu and desktop shortcut. The app updates itself after that. |"
+            echo "| Windows (portable) | \`pocket-library-windows-x64.zip\` | Unzip anywhere and run \`game_tracker.exe\`. |"
             echo "| macOS | \`pocket-library-macos.zip\` | Unzip, move to Applications, then right-click → Open the first time (it isn't notarised by Apple). |"
-            echo "| Linux | \`pocket-library-linux-x64.tar.gz\` | Extract and run \`game-tracker/game_tracker\` (needs GTK 3 and WebKitGTK 4.1). |"
+            echo "| Linux | \`pocket-library-linux-x64.tar.gz\` | Extract and run \`game-tracker/game_tracker\` (needs GTK 3, WebKitGTK 4.1 and libayatana-appindicator3 for the tray icon). |"
             echo "| iPhone / iPad | \`pocket-library-ios-unsigned.ipa\` | Unsigned: install with a sideloading tool such as Sideloadly or AltStore using your Apple ID. |"
             echo "| Web | — | Open https://${OWNER,,}.github.io/${REPO}/ in any browser. |"
             echo
@@ -497,6 +545,18 @@ jobs:
           cd dist
           for f in game-tracker-*; do [ -f "$f" ] && cp "$f" "pocket-library-${f#game-tracker-}"; done
           ls -la
+      - name: Sign the desktop downloads
+        # The Windows and Linux apps refuse an update without a valid signature.
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then echo "::warning::UPDATE_SIGNING_KEY is not set - not signing"; exit 0; fi
+          python3 -m pip install --quiet "cryptography>=42"
+          cd dist
+          for f in *windows*.zip *windows*setup*.exe *linux*.tar.gz; do
+            [ -f "$f" ] && python3 ../tool/ci/sign_update.py sign "$f"
+          done
+          ls -la
       - uses: softprops/action-gh-release@v2
         with:
           # Only the app downloads (not the website bundle, which is also an artifact).
@@ -506,6 +566,8 @@ jobs:
             dist/*.ipa
             dist/*.zip
             dist/*.tar.gz
+            dist/*.exe
+            dist/*.sig
           body_path: release-notes.md
           tag_name: v${{ inputs.version }}
           name: Pocket Library ${{ inputs.version }}
